@@ -29,6 +29,7 @@ export type GameState = {
   hands: Card[][];
   turn: number;
   lastPlay: Play | null;
+  plays: Play[];
   passes: number;
   openingPending: boolean;
   winner: number | null;
@@ -41,10 +42,25 @@ export type Stats = {
   hands: number;
 };
 
+export type GameMode = 'solo' | 'pass-and-play';
+
+export type HandRecord = {
+  handNumber: number;
+  winner: number;
+  plays: Play[];
+  playerNames: string[];
+  mode: GameMode;
+};
+
 export type StoredMatch = {
   game: GameState;
   stats: Stats;
   rankSort: boolean;
+  mode: GameMode;
+  playerNames: string[];
+  handHistory: HandRecord[];
+  revealedPlayer: number | null;
+  soundEnabled: boolean;
 };
 
 export const RANKS = [
@@ -64,8 +80,12 @@ export const RANKS = [
 ] as const;
 
 export const SUITS = ['♦', '♣', '♥', '♠'] as const;
-export const PLAYER_NAMES = ['YOU', 'NORTH', 'EAST', 'WEST'] as const;
+export const DEFAULT_PLAYER_NAMES = ['You', 'Player 2', 'Player 3', 'Player 4'] as const;
 const OPENING_CARD: Card = { rank: 0, suit: 0 };
+
+export function playerLabel(index: number): string {
+  return `Player ${index + 1}`;
+}
 
 export function cardKey(card: Card): string {
   return `${card.rank}-${card.suit}`;
@@ -224,7 +244,7 @@ export function newGame(): GameState {
 
   const hands = [[], [], [], []] as Card[][];
   deck.forEach((card, index) => hands[index % 4]!.push(card));
-  for (let index = 0; index < hands.length; index += 1) {
+  for (let index = 1; index < hands.length; index += 1) {
     hands[index] = sortCards(hands[index]!);
   }
 
@@ -239,8 +259,9 @@ export function newGame(): GameState {
     passes: 0,
     openingPending: true,
     winner: null,
-    message: turn === 0 ? 'You have the 3 of diamonds. Make the opening play.' : `${PLAYER_NAMES[turn]} has the 3 of diamonds.`,
+    message: turn === 0 ? 'You have the 3 of diamonds. Make the opening play.' : `${playerLabel(turn)} has the 3 of diamonds.`,
     turnCount: 0,
+    plays: [],
   };
 }
 
@@ -251,20 +272,22 @@ function recordPlay(state: GameState, player: number, cards: Card[], combo: Comb
   );
   const winner = hands[player]!.length === 0 ? player : null;
   const nextPlayer = (player + 1) % 4;
+  const play = { player, cards: sortCards(cards), combo };
 
   return {
     ...state,
     hands,
     turn: nextPlayer,
-    lastPlay: { player, cards: sortCards(cards), combo },
+    lastPlay: play,
+    plays: [...state.plays, play],
     passes: 0,
     openingPending: false,
     winner,
     message: winner !== null
       ? player === 0
         ? 'You win the hand.'
-        : `${PLAYER_NAMES[player]} wins the hand.`
-      : `${PLAYER_NAMES[player]} played ${combo.kind}.`,
+        : `${playerLabel(player)} wins the hand.`
+      : `${playerLabel(player)} played ${combo.kind}.`,
     turnCount: state.turnCount + 1,
   };
 }
@@ -291,7 +314,7 @@ export function passTurn(state: GameState): GameState {
       turn: nextLeader,
       lastPlay: null,
       passes: 0,
-      message: `Table cleared. ${PLAYER_NAMES[nextLeader]} leads.`,
+      message: `Table cleared. ${playerLabel(nextLeader)} leads.`,
       turnCount: state.turnCount + 1,
     };
   }
@@ -301,7 +324,7 @@ export function passTurn(state: GameState): GameState {
     ...state,
     turn: nextPlayer,
     passes,
-    message: `${PLAYER_NAMES[state.turn]} passed.`,
+    message: `${playerLabel(state.turn)} passed.`,
     turnCount: state.turnCount + 1,
   };
 }
@@ -330,10 +353,42 @@ export function computerTurn(state: GameState): GameState {
       !state.openingPending ||
       cards.some((card) => cardKey(card) === cardKey(OPENING_CARD)),
     )
-    .sort((a, b) => b.combo.size - a.combo.size || a.combo.power - b.combo.power);
+    .map((play) => ({ ...play, leadCost: scoreLead(hand, play.cards, play.combo) }))
+    .sort((a, b) => a.leadCost - b.leadCost || a.combo.power - b.combo.power);
 
   if (leads.length === 0) return state;
-  return recordPlay(state, state.turn, leads[0]!.cards, leads[0]!.combo);
+  const bestCost = leads[0]!.leadCost;
+  const goodLeads = leads.filter((play) => play.leadCost <= bestCost + 1.25);
+  const chosen = goodLeads[Math.floor(Math.random() * goodLeads.length)]!;
+  return recordPlay(state, state.turn, chosen.cards, chosen.combo);
+}
+
+function scoreLead(hand: Card[], cards: Card[], combo: Combo): number {
+  const rankCounts = new Map<number, number>();
+  for (const card of hand) rankCounts.set(card.rank, (rankCounts.get(card.rank) ?? 0) + 1);
+
+  const playedCounts = new Map<number, number>();
+  for (const card of cards) playedCounts.set(card.rank, (playedCounts.get(card.rank) ?? 0) + 1);
+
+  const sizeCost: Record<number, number> = { 1: 0, 2: 4, 3: 13, 5: 18 };
+  let score = (sizeCost[combo.size] ?? 30) - combo.size * 1.7;
+  score += cards.reduce((sum, card) => sum + card.rank * 0.32, 0);
+  score += Math.max(...cards.map((card) => card.rank)) * 0.38;
+
+  for (const [rank, groupSize] of rankCounts) {
+    if (groupSize < 2) continue;
+    const played = playedCounts.get(rank) ?? 0;
+    if (played === 0) continue;
+
+    if (played === groupSize) {
+      const premium = Math.max(0, rank - 7);
+      score += groupSize === 3 ? 5 + premium * 4 : 3 + premium * 2;
+    } else {
+      score += groupSize === 3 ? 5 : 2;
+    }
+  }
+
+  return score;
 }
 
 export function isValidStoredMatch(value: unknown): value is StoredMatch {
@@ -367,7 +422,56 @@ export function isValidStoredMatch(value: unknown): value is StoredMatch {
       return false;
     }
   }
+  const validPlay = (play: unknown): play is Play => {
+    if (!play || typeof play !== 'object') return false;
+    const item = play as Play;
+    return (
+      Number.isInteger(item.player) &&
+      item.player >= 0 &&
+      item.player <= 3 &&
+      Array.isArray(item.cards) &&
+      item.cards.every(validCard) &&
+      getCombo(item.cards) !== null
+    );
+  };
+  const optionalArraysValid =
+    (candidate.handHistory === undefined ||
+      (Array.isArray(candidate.handHistory) &&
+        candidate.handHistory.every((record) => {
+          if (!record || typeof record !== 'object') return false;
+          const item = record as HandRecord;
+          return (
+            Number.isInteger(item.handNumber) &&
+            item.handNumber > 0 &&
+            Number.isInteger(item.winner) &&
+            item.winner >= 0 &&
+            item.winner <= 3 &&
+            Array.isArray(item.plays) &&
+            item.plays.every(validPlay) &&
+            Array.isArray(item.playerNames) &&
+            item.playerNames.length === 4 &&
+            item.playerNames.every((name) => typeof name === 'string') &&
+            (item.mode === 'solo' || item.mode === 'pass-and-play')
+          );
+        }))) &&
+    (game.plays === undefined ||
+      (Array.isArray(game.plays) && game.plays.every(validPlay))) &&
+    (candidate.mode === undefined ||
+      candidate.mode === 'solo' ||
+      candidate.mode === 'pass-and-play') &&
+    (candidate.playerNames === undefined ||
+      (Array.isArray(candidate.playerNames) &&
+        candidate.playerNames.length === 4 &&
+        candidate.playerNames.every((name) => typeof name === 'string'))) &&
+    (candidate.revealedPlayer === undefined ||
+      candidate.revealedPlayer === null ||
+      (Number.isInteger(candidate.revealedPlayer) &&
+        candidate.revealedPlayer >= 0 &&
+        candidate.revealedPlayer <= 3)) &&
+    (candidate.soundEnabled === undefined || typeof candidate.soundEnabled === 'boolean');
+
   return (
+    optionalArraysValid &&
     Number.isInteger(game.passes) &&
     game.passes >= 0 &&
     game.passes <= 2 &&
