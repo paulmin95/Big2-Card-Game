@@ -27,6 +27,7 @@ export function PlayerSeat({
   testID: string;
 }) {
   const colors = useColors();
+  const compact = width < 82;
   const pulse = useSharedValue(0);
   const haloStyle = useAnimatedStyle(() => ({
     opacity: pulse.value,
@@ -65,24 +66,31 @@ export function PlayerSeat({
       ]}
     >
       <Animated.View
-        pointerEvents="none"
         style={[
           styles.halo,
-          { borderColor: colors.primary, shadowColor: colors.primary },
+          { pointerEvents: 'none', borderColor: colors.primary },
           haloStyle,
         ]}
       />
       <View style={styles.nameRow}>
         <Text
           numberOfLines={1}
-          style={[styles.name, { color: active ? colors.primary : colors.mutedForeground }]}
+          style={[
+            styles.name,
+            {
+              color: active ? colors.primary : colors.mutedForeground,
+              fontSize: compact ? 7 : 8,
+            },
+          ]}
         >
           {name.toUpperCase()}
         </Text>
-        {isHuman ? (
-          <Feather name="user" size={11} color={active ? colors.primary : colors.mutedForeground} />
-        ) : (
-          <Feather name="cpu" size={11} color={active ? colors.primary : colors.mutedForeground} />
+        {!compact && (
+          <Feather
+            name={isHuman ? 'user' : 'cpu'}
+            size={11}
+            color={active ? colors.primary : colors.mutedForeground}
+          />
         )}
       </View>
       <View style={styles.countRow}>
@@ -112,8 +120,9 @@ const styles = StyleSheet.create({
     bottom: -5,
     borderWidth: 1.5,
     borderRadius: 19,
-    shadowOpacity: 0.48,
-    shadowRadius: 9,
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 0 10px rgba(215, 180, 106, 0.36)' }
+      : { shadowColor: '#D7B46A', shadowOpacity: 0.48, shadowRadius: 9 }),
   },
   activeElevation: {
     elevation: 8,

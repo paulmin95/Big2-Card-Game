@@ -80,7 +80,7 @@ export const RANKS = [
 ] as const;
 
 export const SUITS = ['♦', '♣', '♥', '♠'] as const;
-export const DEFAULT_PLAYER_NAMES = ['You', 'Player 2', 'Player 3', 'Player 4'] as const;
+export const DEFAULT_PLAYER_NAMES = ['Player 1', 'Player 2', 'Player 3', 'Player 4'] as const;
 const OPENING_CARD: Card = { rank: 0, suit: 0 };
 
 export function playerLabel(index: number): string {

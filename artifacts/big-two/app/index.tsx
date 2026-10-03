@@ -8,18 +8,23 @@ import {
   Modal,
   Platform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { KeyboardAwareScrollViewCompat } from '@/components/KeyboardAwareScrollViewCompat';
+import { PlayedHandMotion } from '@/components/PlayedHandMotion';
+import { PlayerSeat } from '@/components/PlayerSeat';
 import { useColors } from '@/hooks/useColors';
 import {
   Card,
+  DEFAULT_PLAYER_NAMES,
+  HandRecord,
+  GameMode,
   GameState,
-  PLAYER_NAMES,
   RANKS,
   SUITS,
   StoredMatch,
@@ -30,10 +35,12 @@ import {
   isValidStoredMatch,
   newGame,
   passTurn,
+  playerLabel,
   playCards,
   sortCards,
   validatePlay,
 } from '@/lib/game';
+import { useGameAudio } from '@/lib/game-audio';
 
 const SAVE_KEY = 'big-two:local-match:v1';
 
@@ -44,11 +51,66 @@ function finishMatch(previous: StoredMatch, game: GameState): StoredMatch {
   return {
     ...previous,
     game,
+    handHistory: [
+      ...previous.handHistory,
+      {
+        handNumber: previous.stats.hands + 1,
+        winner: game.winner!,
+        plays: game.plays,
+        playerNames: [...previous.playerNames],
+        mode: previous.mode,
+      },
+    ].slice(-50),
     stats: {
       wins: previous.stats.wins + (game.winner === 0 ? 1 : 0),
       hands: previous.stats.hands + 1,
     },
   };
+}
+
+function createStoredMatch(): StoredMatch {
+  return {
+    game: newGame(),
+    stats: { wins: 0, hands: 0 },
+    rankSort: false,
+    mode: 'solo',
+    playerNames: [...DEFAULT_PLAYER_NAMES],
+    handHistory: [],
+    revealedPlayer: null,
+    soundEnabled: true,
+  };
+}
+
+function normalizeStoredMatch(saved: StoredMatch): StoredMatch {
+  return {
+    ...saved,
+    game: { ...saved.game, plays: saved.game.plays ?? [] },
+    mode: saved.mode ?? 'solo',
+    playerNames: saved.playerNames ?? [...DEFAULT_PLAYER_NAMES],
+    handHistory: saved.handHistory ?? [],
+    revealedPlayer: null,
+    soundEnabled: saved.soundEnabled ?? true,
+  };
+}
+
+function displayName(match: StoredMatch, player: number): string {
+  if (match.mode === 'solo') {
+    return player === 0 ? 'You' : DEFAULT_PLAYER_NAMES[player] ?? playerLabel(player);
+  }
+  return match.playerNames[player]?.trim() || playerLabel(player);
+}
+
+function displayRecordName(record: HandRecord, player: number): string {
+  if (record.mode === 'solo') {
+    return player === 0 ? 'You' : DEFAULT_PLAYER_NAMES[player] ?? playerLabel(player);
+  }
+  return record.playerNames[player]?.trim() || playerLabel(player);
+}
+
+function compactCards(cards: Card[]): string {
+  return sortCards(cards)
+    .map((card) => `${RANKS[card.rank]}${SUITS[card.suit]}`)
+    .join('  ');
 }
 
 function CardFace({
@@ -202,7 +264,15 @@ function InfoModal({
               <Feather name="x" size={21} color={colors.foreground} />
             </Pressable>
           </View>
-          <ScrollView showsVerticalScrollIndicator={false}>{children}</ScrollView>
+          <KeyboardAwareScrollViewCompat
+            bottomOffset={24}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            style={{ flexShrink: 1 }}
+            contentContainerStyle={{ paddingBottom: 6 }}
+          >
+            {children}
+          </KeyboardAwareScrollViewCompat>
         </View>
       </View>
     </Modal>
@@ -212,15 +282,25 @@ function InfoModal({
 export default function GameScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { width: windowWidth } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const { playDeal, playHand } = useGameAudio();
   const [match, setMatch] = useState<StoredMatch | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
-  const [modal, setModal] = useState<'rules' | 'new-hand' | null>(null);
+  const [modal, setModal] = useState<'rules' | 'new-hand' | 'history' | 'settings' | null>(null);
   const [validationMessage, setValidationMessage] = useState('');
   const [hydrated, setHydrated] = useState(false);
-  const usableWidth = Math.min(windowWidth, 500);
-  const cardWidth = Math.max(37, Math.min(49, (usableWidth - 36) / 7.45));
-  const cardStep = (usableWidth - 36 - cardWidth) / 12;
+  const [freshDealPending, setFreshDealPending] = useState(false);
+  const handWidth = windowWidth - 36;
+  const compactHeader = windowWidth < 360;
+  const cardWidth = Math.max(36, Math.min(49, handWidth / 7.45));
+  const cardStep = (handWidth - cardWidth) / 12;
+  const tableSize = Math.max(260, Math.min(handWidth, windowHeight * 0.42, 400));
+  const sideSeatWidth = Math.min(94, tableSize * 0.25);
+  const edgeSeatWidth = Math.min(148, tableSize * 0.42);
+  const tableCardWidth = Math.max(
+    27,
+    Math.min(40, (tableSize - sideSeatWidth * 2 - 16) / 5 + 7),
+  );
 
   useEffect(() => {
     let active = true;
@@ -229,21 +309,15 @@ export default function GameScreen() {
         const raw = await AsyncStorage.getItem(SAVE_KEY);
         const parsed: unknown = raw ? JSON.parse(raw) : null;
         if (active && isValidStoredMatch(parsed)) {
-          setMatch(parsed);
+          setMatch(normalizeStoredMatch(parsed));
         } else if (active) {
-          setMatch({
-            game: newGame(),
-            stats: { wins: 0, hands: 0 },
-            rankSort: true,
-          });
+          setMatch(createStoredMatch());
+          setFreshDealPending(true);
         }
       } catch {
         if (active) {
-          setMatch({
-            game: newGame(),
-            stats: { wins: 0, hands: 0 },
-            rankSort: true,
-          });
+          setMatch(createStoredMatch());
+          setFreshDealPending(true);
         }
       } finally {
         if (active) setHydrated(true);
@@ -263,37 +337,58 @@ export default function GameScreen() {
   }, [hydrated, match]);
 
   useEffect(() => {
+    if (!hydrated || !freshDealPending || !match) return;
+    if (match.soundEnabled) playDeal();
+    setFreshDealPending(false);
+  }, [freshDealPending, hydrated, match, playDeal]);
+
+  useEffect(() => {
     if (!hydrated || !match) return;
     const { game } = match;
-    if (game.turn === 0 || game.winner !== null) return;
+    if (match.mode !== 'solo' || game.turn === 0 || game.winner !== null) return;
 
     const timer = setTimeout(() => {
       setValidationMessage('');
-      setMatch((current) => {
-        if (!current || current.game.turn === 0 || current.game.winner !== null) return current;
-        return finishMatch(current, computerTurn(current.game));
-      });
-    }, 760);
+      const nextGame = computerTurn(game);
+      if (
+        match.soundEnabled &&
+        nextGame.plays.length > game.plays.length &&
+        nextGame.lastPlay
+      ) {
+        playHand(nextGame.lastPlay.cards.length);
+      }
+      setMatch((current) =>
+        current &&
+        current.mode === 'solo' &&
+        current.game.turn === game.turn &&
+        current.game.turnCount === game.turnCount
+          ? finishMatch(current, nextGame)
+          : current,
+      );
+    }, 1420);
 
     return () => clearTimeout(timer);
-  }, [hydrated, match]);
+  }, [hydrated, match, playHand]);
 
   const game = match?.game;
-  const userTurn = game?.turn === 0 && game.winner === null;
-  const hand = game?.hands[0] ?? [];
+  const activePlayer = game && match?.mode === 'pass-and-play' ? game.turn : 0;
+  const humanTurn = !!game && (match?.mode === 'pass-and-play' || game.turn === 0);
+  const handRevealed = !!match && !!game && (
+    match.mode === 'solo' || match.revealedPlayer === game.turn
+  );
+  const canInteract = !!game && humanTurn && handRevealed && game.winner === null;
+  const hand = game?.hands[activePlayer] ?? [];
   const displayedHand = useMemo(() => {
     if (!match) return [];
-    const cards = sortCards(hand);
-    if (match.rankSort) return cards;
-    return [...cards].sort((a, b) => a.suit - b.suit || a.rank - b.rank);
-  }, [hand, match]);
+    return match.rankSort ? sortCards(hand) : hand;
+  }, [hand, match?.rankSort]);
   const selectedCards = useMemo(
     () => displayedHand.filter((card) => selectedKeys.includes(cardKey(card))),
     [displayedHand, selectedKeys],
   );
 
   const toggleCard = (card: Card): void => {
-    if (!userTurn) return;
+    if (!canInteract) return;
     const key = cardKey(card);
     setValidationMessage('');
     void Haptics.selectionAsync();
@@ -303,7 +398,7 @@ export default function GameScreen() {
   };
 
   const submitPlay = (): void => {
-    if (!match || !userTurn) return;
+    if (!match || !canInteract) return;
     const error = validatePlay(selectedCards, game!.lastPlay, game!.openingPending);
     if (error) {
       setValidationMessage(error);
@@ -314,29 +409,50 @@ export default function GameScreen() {
     setValidationMessage('');
     setSelectedKeys([]);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    setMatch((current) =>
-      current && current.game.turn === 0
-        ? finishMatch(current, playCards(current.game, selectedCards))
-        : current,
-    );
+    if (match.soundEnabled) playHand(selectedCards.length);
+    setMatch((current) => {
+      if (
+        !current ||
+        current.game.turn !== game!.turn ||
+        current.game.turnCount !== game!.turnCount
+      ) {
+        return current;
+      }
+      const next = finishMatch(current, playCards(current.game, selectedCards));
+      return current.mode === 'pass-and-play' ? { ...next, revealedPlayer: null } : next;
+    });
   };
 
   const submitPass = (): void => {
-    if (!match || !userTurn || !game!.lastPlay) return;
+    if (!match || !canInteract || !game!.lastPlay) return;
     setSelectedKeys([]);
     setValidationMessage('');
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setMatch((current) =>
-      current && current.game.turn === 0
-        ? finishMatch(current, passTurn(current.game))
-        : current,
-    );
+    setMatch((current) => {
+      if (
+        !current ||
+        current.game.turn !== game!.turn ||
+        current.game.turnCount !== game!.turnCount
+      ) {
+        return current;
+      }
+      const next = finishMatch(current, passTurn(current.game));
+      return current.mode === 'pass-and-play' ? { ...next, revealedPlayer: null } : next;
+    });
   };
 
   const toggleSort = (): void => {
-    if (!match) return;
+    if (!match || !canInteract) return;
     setMatch((current) => current ? { ...current, rankSort: !current.rankSort } : current);
     void Haptics.selectionAsync();
+  };
+
+  const revealHand = (): void => {
+    if (!game || !match || match.mode !== 'pass-and-play' || game.winner !== null) return;
+    setSelectedKeys([]);
+    setValidationMessage('');
+    setMatch((current) => current ? { ...current, revealedPlayer: current.game.turn } : current);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
   const confirmNewHand = (): void => {
@@ -344,7 +460,43 @@ export default function GameScreen() {
     setSelectedKeys([]);
     setValidationMessage('');
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setMatch((current) => current ? { ...current, game: newGame() } : current);
+    if (match?.soundEnabled) playDeal();
+    setMatch((current) =>
+      current
+        ? {
+            ...current,
+            game: newGame(),
+            rankSort: false,
+            revealedPlayer: null,
+          }
+        : current,
+    );
+  };
+
+  const changeMode = (mode: GameMode): void => {
+    setSelectedKeys([]);
+    setValidationMessage('');
+    setMatch((current) =>
+      current ? { ...current, mode, revealedPlayer: null } : current,
+    );
+  };
+
+  const changePlayerName = (player: number, name: string): void => {
+    setMatch((current) =>
+      current
+        ? {
+            ...current,
+            playerNames: current.playerNames.map((currentName, index) =>
+              index === player ? name : currentName,
+            ),
+          }
+        : current,
+    );
+  };
+
+  const toggleSound = (): void => {
+    setMatch((current) => current ? { ...current, soundEnabled: !current.soundEnabled } : current);
+    void Haptics.selectionAsync();
   };
 
   if (!hydrated || !match || !game) {
@@ -358,19 +510,26 @@ export default function GameScreen() {
   }
 
   const winner = game.winner;
+  const activeName = displayName(match, game.turn);
+  const currentStatus = winner !== null || humanTurn;
   const statusText = winner !== null
-    ? winner === 0
-      ? 'You cleared your hand first.'
-      : `${PLAYER_NAMES[winner]} cleared their hand first.`
-    : game.turn === 0
-      ? game.openingPending
-        ? 'Open with the 3 of diamonds.'
-        : game.lastPlay
-          ? `Beat ${PLAYER_NAMES[game.lastPlay.player]} or pass.`
-          : 'The table is yours to lead.'
-      : `${PLAYER_NAMES[game.turn]} is thinking…`;
+    ? `${displayName(match, winner)} cleared their hand first.`
+    : match.mode === 'pass-and-play'
+      ? !handRevealed
+        ? `Pass the device to ${activeName}, then reveal their hand.`
+        : game.openingPending
+          ? `${activeName}: open with the 3 of diamonds.`
+          : game.lastPlay
+            ? `${activeName}: beat ${displayName(match, game.lastPlay.player)} or pass.`
+            : `${activeName}: lead a new trick.`
+      : game.turn === 0
+        ? game.openingPending
+          ? 'Open with the 3 of diamonds.'
+          : game.lastPlay
+            ? `Beat ${displayName(match, game.lastPlay.player)} or pass.`
+            : 'The table is yours to lead.'
+        : `${activeName} is thinking…`;
   const visibleNotice = validationMessage || statusText;
-  const currentStatus = winner !== null || game.turn === 0;
 
   return (
     <View
@@ -387,27 +546,65 @@ export default function GameScreen() {
       <View style={styles.gameShell}>
         <View style={styles.topBar}>
           <View>
-            <Text style={[styles.wordmark, { color: colors.foreground }]}>BIG TWO</Text>
-            <Text style={[styles.submark, { color: colors.mutedForeground }]}>FOUR PLAYERS · ONE TABLE</Text>
+            <Text
+              style={[
+                styles.wordmark,
+                { color: colors.foreground, fontSize: compactHeader ? 18 : 20 },
+              ]}
+            >
+              BIG TWO
+            </Text>
+            <Text
+              style={[
+                styles.submark,
+                {
+                  color: colors.mutedForeground,
+                  fontSize: compactHeader ? 7 : 8,
+                  letterSpacing: compactHeader ? 0.8 : 1.15,
+                },
+              ]}
+            >
+              FOUR PLAYERS · ONE TABLE
+            </Text>
           </View>
-          <View style={styles.topActions}>
-            <View style={[styles.scorePill, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Feather name="award" size={13} color={colors.primary} />
+          <View style={[styles.topActions, compactHeader && styles.topActionsCompact]}>
+            <View
+              style={[
+                styles.scorePill,
+                compactHeader && styles.scorePillCompact,
+                { backgroundColor: colors.card, borderColor: colors.border },
+              ]}
+            >
+              {!compactHeader && <Feather name="award" size={13} color={colors.primary} />}
               <Text style={[styles.scoreText, { color: colors.foreground }]}>
                 {match.stats.wins}<Text style={{ color: colors.mutedForeground }}> / {match.stats.hands}</Text>
               </Text>
             </View>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Big Two rules"
-              onPress={() => setModal('rules')}
-              testID="rules-button"
+              accessibilityLabel="Review previous hands"
+              onPress={() => setModal('history')}
+              testID="history-button"
               style={({ pressed }) => [
                 styles.iconButton,
+                compactHeader && styles.iconButtonCompact,
                 { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.7 : 1 },
               ]}
             >
-              <Feather name="help-circle" size={19} color={colors.foreground} />
+              <Feather name="clock" size={16} color={colors.foreground} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Game settings"
+              onPress={() => setModal('settings')}
+              testID="settings-button"
+              style={({ pressed }) => [
+                styles.iconButton,
+                compactHeader && styles.iconButtonCompact,
+                { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.7 : 1 },
+              ]}
+            >
+              <Feather name="settings" size={16} color={colors.foreground} />
             </Pressable>
             <Pressable
               accessibilityRole="button"
@@ -416,6 +613,7 @@ export default function GameScreen() {
               testID="new-hand-button"
               style={({ pressed }) => [
                 styles.iconButton,
+                compactHeader && styles.iconButtonCompact,
                 { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.7 : 1 },
               ]}
             >
@@ -424,132 +622,215 @@ export default function GameScreen() {
           </View>
         </View>
 
-        <View style={styles.seatRow}>
-          {PLAYER_NAMES.map((name, index) => {
-            const active = winner === null && game.turn === index;
-            const isHuman = index === 0;
-            return (
-              <View
-                key={name}
-                style={[
-                  styles.seat,
-                  {
-                    backgroundColor: active ? colors.accent : colors.card,
-                    borderColor: active ? colors.primary : colors.border,
-                    opacity: winner !== null ? 0.72 : 1,
-                  },
-                ]}
-              >
-                <View style={styles.seatHeader}>
-                  <View style={[styles.seatDot, { backgroundColor: active ? colors.primary : colors.mutedForeground }]} />
-                  <Text style={[styles.seatName, { color: active ? colors.primary : colors.mutedForeground }]}>
-                    {name}
-                  </Text>
-                </View>
-                <Text style={[styles.seatCount, { color: colors.foreground }]}>
-                  {game.hands[index]!.length}
-                  <Text style={[styles.seatCardsLabel, { color: colors.mutedForeground }]}> cards</Text>
-                </Text>
-                {!isHuman && <Text style={[styles.botLabel, { color: colors.mutedForeground }]}>CPU</Text>}
-              </View>
-            );
-          })}
-        </View>
+        <View
+          style={[
+            styles.circleTable,
+            {
+              width: tableSize,
+              height: tableSize,
+              borderRadius: tableSize / 2,
+            },
+          ]}
+          testID="four-seat-table"
+        >
+          <View
+            style={[
+              styles.circleTableSurface,
+              {
+                borderRadius: (tableSize - 16) / 2,
+                borderColor: 'rgba(220, 203, 158, 0.2)',
+              },
+            ]}
+          />
+          <View style={[styles.compassSeat, styles.northSeat]}>
+            <PlayerSeat
+              name={displayName(match, 2)}
+              cards={game.hands[2]!.length}
+              active={winner === null && game.turn === 2}
+              isHuman={match.mode === 'pass-and-play'}
+              width={edgeSeatWidth}
+              testID="seat-player-3"
+            />
+          </View>
+          <View style={[styles.compassSeat, styles.westSeat, { width: sideSeatWidth }]}>
+            <PlayerSeat
+              name={displayName(match, 1)}
+              cards={game.hands[1]!.length}
+              active={winner === null && game.turn === 1}
+              isHuman={match.mode === 'pass-and-play'}
+              width={sideSeatWidth}
+              testID="seat-player-2"
+            />
+          </View>
+          <View style={[styles.compassSeat, styles.eastSeat, { width: sideSeatWidth }]}>
+            <PlayerSeat
+              name={displayName(match, 3)}
+              cards={game.hands[3]!.length}
+              active={winner === null && game.turn === 3}
+              isHuman={match.mode === 'pass-and-play'}
+              width={sideSeatWidth}
+              testID="seat-player-4"
+            />
+          </View>
+          <View style={[styles.compassSeat, styles.southSeat]}>
+            <PlayerSeat
+              name={displayName(match, 0)}
+              cards={game.hands[0]!.length}
+              active={winner === null && game.turn === 0}
+              isHuman
+              width={edgeSeatWidth}
+              testID="seat-player-1"
+            />
+          </View>
 
-        <View style={[styles.table, { backgroundColor: '#12392B', borderColor: '#315A45' }]}>
-          <View style={[styles.tableInner, { borderColor: 'rgba(220, 203, 158, 0.18)' }]}>
-            <View style={styles.tableTop}>
-              <View style={styles.tableOverline}>
-                <View style={[styles.tableDot, { backgroundColor: colors.primary }]} />
-                <Text style={styles.tableLabel}>
-                  {game.lastPlay ? `${describeCombo(game.lastPlay.combo).toUpperCase()} · ${game.lastPlay.cards.length} CARDS` : 'THE TABLE'}
-                </Text>
-              </View>
-              <Text style={styles.turnCounter}>HAND {match.stats.hands + (winner === null ? 1 : 0)}</Text>
+          <View
+            style={[
+              styles.tableCenter,
+              {
+                left: sideSeatWidth - 5,
+                right: sideSeatWidth - 5,
+                top: tableSize * 0.28,
+                bottom: tableSize * 0.28,
+              },
+            ]}
+          >
+            <View style={styles.tableOverline}>
+              <View style={[styles.tableDot, { backgroundColor: colors.primary }]} />
+              <Text style={styles.tableLabel}>
+                {game.lastPlay
+                  ? `${describeCombo(game.lastPlay.combo).toUpperCase()} · ${game.lastPlay.cards.length} CARDS`
+                  : 'CURRENT TRICK'}
+              </Text>
             </View>
-
             <View style={styles.playArea}>
               {game.lastPlay ? (
-                <>
+                <PlayedHandMotion player={game.lastPlay.player} playId={game.plays.length}>
                   <View style={styles.playedCards} accessibilityLabel="Cards currently on the table">
-                    {game.lastPlay.cards.map((card) => (
-                      <View key={cardKey(card)} style={styles.playedCard}>
-                        <CardFace card={card} width={43} height={67} />
+                    {game.lastPlay.cards.map((card, index) => (
+                      <View
+                        key={`${game.plays.length}-${index}-${cardKey(card)}`}
+                        style={[styles.playedCard, { marginHorizontal: -tableCardWidth * 0.11 }]}
+                      >
+                        <CardFace
+                          card={card}
+                          width={tableCardWidth}
+                          height={tableCardWidth * 1.52}
+                        />
                       </View>
                     ))}
                   </View>
-                  <Text style={styles.lastPlayBy}>{PLAYER_NAMES[game.lastPlay.player]} PLAYED</Text>
-                </>
+                </PlayedHandMotion>
               ) : winner !== null ? (
                 <View style={styles.resultMark}>
-                  <Feather name={winner === 0 ? 'award' : 'flag'} size={30} color={colors.primary} />
+                  <Feather name={winner === 0 ? 'award' : 'flag'} size={28} color={colors.primary} />
                   <Text style={styles.resultText}>{winner === 0 ? 'HAND WON' : 'HAND OVER'}</Text>
                 </View>
               ) : (
                 <View style={styles.waitingMark}>
                   <Text style={styles.waitingSuit}>♠</Text>
-                  <Text style={styles.waitingText}>A good hand starts here.</Text>
+                  <Text style={styles.waitingText}>Waiting for a lead</Text>
                 </View>
               )}
             </View>
-
-            <View style={styles.tableBottom}>
-              <Text
-                accessibilityLiveRegion="polite"
-                numberOfLines={2}
-                style={[styles.statusMessage, { color: currentStatus && winner === null ? colors.primary : '#E0E9E1' }]}
-              >
-                {visibleNotice}
-              </Text>
-              {game.turn !== 0 && winner === null && (
-                <ActivityIndicator size="small" color={colors.primary} />
-              )}
-            </View>
+            <Text
+              accessibilityLiveRegion="polite"
+              numberOfLines={3}
+              style={[
+                styles.statusMessage,
+                { color: currentStatus && winner === null ? colors.primary : '#E0E9E1' },
+              ]}
+            >
+              {visibleNotice}
+            </Text>
+            {match.mode === 'solo' && game.turn !== 0 && winner === null && (
+              <ActivityIndicator size="small" color={colors.primary} style={styles.cpuSpinner} />
+            )}
           </View>
         </View>
 
         <View style={styles.handHeading}>
           <View>
-            <Text style={[styles.handTitle, { color: colors.foreground }]}>YOUR HAND</Text>
+            <Text style={[styles.handTitle, { color: colors.foreground }]}>
+              {winner !== null
+                ? 'HAND COMPLETE'
+                : match.mode === 'pass-and-play'
+                  ? `${activeName.toUpperCase()}'S HAND`
+                  : 'YOUR HAND'}
+            </Text>
             <Text style={[styles.handHint, { color: colors.mutedForeground }]}>
-              {selectedKeys.length > 0
-                ? `${selectedKeys.length} selected`
-                : `${hand.length} cards · tap to select`}
+              {winner !== null
+                ? `${displayName(match, winner)} won this hand`
+                : !handRevealed
+                  ? `${hand.length} cards · hidden until revealed`
+                  : selectedKeys.length > 0
+                    ? `${selectedKeys.length} selected`
+                    : `${hand.length} cards · ${match.rankSort ? 'tap to select' : 'dealt order · tap to select'}`}
             </Text>
           </View>
           <Text style={[styles.selectionHint, { color: colors.primary }]}>
-            {game.openingPending && game.turn === 0 ? '3♦ LEADS' : ''}
+            {game.openingPending && (match.mode === 'pass-and-play' || game.turn === 0) ? '3♦ LEADS' : ''}
           </Text>
         </View>
 
         <View style={[styles.handArea, { height: 111 }]}>
-          {displayedHand.map((card, index) => {
-            const key = cardKey(card);
-            const isSelected = selectedKeys.includes(key);
-            return (
-              <View
-                key={key}
-                style={[
-                  styles.handCardPosition,
-                  {
-                    left: index * cardStep,
-                    width: cardWidth,
-                    zIndex: isSelected ? 25 + index : index,
-                  },
-                ]}
-              >
-                <CardFace
-                  card={card}
-                  width={cardWidth}
-                  height={91}
-                  selected={isSelected}
-                  disabled={!userTurn}
-                  onPress={() => toggleCard(card)}
-                  testID={`card-${key}`}
-                />
+          {winner !== null ? (
+            <View style={styles.handFinished}>
+              <Feather name="check-circle" size={22} color={colors.primary} />
+              <Text style={[styles.hiddenHandText, { color: colors.mutedForeground }]}>
+                Deal another hand when you’re ready.
+              </Text>
+            </View>
+          ) : !handRevealed ? (
+            <View style={styles.hiddenHand}>
+              <View style={styles.cardBackStack}>
+                {[0, 1, 2, 3, 4].map((index) => (
+                  <View
+                    key={index}
+                    style={[
+                      styles.cardBack,
+                      {
+                        left: 18 + index * 16,
+                        transform: [{ rotate: `${(index - 2) * 5}deg` }],
+                      },
+                    ]}
+                  >
+                    <Text style={styles.cardBackMark}>♠</Text>
+                  </View>
+                ))}
               </View>
-            );
-          })}
+              <Text style={[styles.hiddenHandText, { color: colors.mutedForeground }]}>
+                Private hand · reveal when the device is with you
+              </Text>
+            </View>
+          ) : (
+            displayedHand.map((card, index) => {
+              const key = cardKey(card);
+              const isSelected = selectedKeys.includes(key);
+              return (
+                <View
+                  key={key}
+                  style={[
+                    styles.handCardPosition,
+                    {
+                      left: index * cardStep,
+                      width: cardWidth,
+                      zIndex: isSelected ? 25 + index : index,
+                    },
+                  ]}
+                >
+                  <CardFace
+                    card={card}
+                    width={cardWidth}
+                    height={91}
+                    selected={isSelected}
+                    disabled={!canInteract}
+                    onPress={() => toggleCard(card)}
+                    testID={`card-${key}`}
+                  />
+                </View>
+              );
+            })
+          )}
         </View>
 
         <View style={styles.actionRow}>
@@ -561,27 +842,35 @@ export default function GameScreen() {
               primary
               testID="deal-again-button"
             />
+          ) : match.mode === 'pass-and-play' && !handRevealed ? (
+            <ActionButton
+              label={`Show ${activeName}'s hand`}
+              icon="eye"
+              onPress={revealHand}
+              primary
+              testID="show-hand-button"
+            />
           ) : (
             <>
               <ActionButton
                 label="Sort"
-                icon="shuffle"
+                icon="align-center"
                 onPress={toggleSort}
-                disabled={!userTurn}
+                disabled={!canInteract}
                 testID="sort-button"
               />
               <ActionButton
                 label="Pass"
                 icon="corner-up-right"
                 onPress={submitPass}
-                disabled={!userTurn || !game.lastPlay}
+                disabled={!canInteract || !game.lastPlay}
                 testID="pass-button"
               />
               <ActionButton
                 label="Play"
                 icon="play"
                 onPress={submitPlay}
-                disabled={!userTurn || selectedKeys.length === 0}
+                disabled={!canInteract || selectedKeys.length === 0}
                 primary
                 testID="play-button"
               />
@@ -589,13 +878,23 @@ export default function GameScreen() {
           )}
         </View>
         <Text style={[styles.footerNote, { color: colors.mutedForeground }]}>
-          {winner !== null ? 'A fresh hand is one tap away.' : game.turn === 0 ? 'Select cards, then play or pass.' : 'The other players are taking their turns.'}
+          {winner !== null
+            ? 'Your completed hands remain available in history.'
+            : match.mode === 'pass-and-play'
+              ? handRevealed
+                ? 'Cards will hide automatically when this player plays or passes.'
+                : 'Keep the cards covered while passing the device.'
+              : game.turn === 0
+                ? 'Select cards, then play or pass.'
+                : 'The other players are taking their turns.'}
         </Text>
       </View>
 
       <InfoModal visible={modal === 'rules'} title="How to play" onClose={() => setModal(null)}>
         <Text style={[styles.modalLead, { color: colors.foreground }]}>
-          Be the first to play every card in your hand. You are up against three computer players.
+          {match.mode === 'solo'
+            ? 'Be the first to play every card in your hand. Play against three computer players.'
+            : 'Four people share one device. Keep each hand hidden during the handoff, then reveal it when that player is ready.'}
         </Text>
         <Text style={[styles.ruleHeading, { color: colors.primary }]}>CARD ORDER</Text>
         <Text style={[styles.ruleText, { color: colors.secondaryForeground }]}>
@@ -610,8 +909,175 @@ export default function GameScreen() {
           To beat a play, use the same number of cards and a stronger combination. You may pass instead. After three players pass, the last player to play leads a new trick.
         </Text>
         <Text style={[styles.ruleFootnote, { color: colors.mutedForeground }]}>
-          Your hand and win count are saved on this device.
+          Your game, names, and completed-hand history are saved on this device.
         </Text>
+      </InfoModal>
+
+      <InfoModal visible={modal === 'settings'} title="Game settings" onClose={() => setModal(null)}>
+        <Text style={[styles.ruleHeading, { color: colors.primary }]}>PLAY MODE</Text>
+        <View style={styles.modeOptions}>
+          {([
+            ['solo', 'Play CPUs'],
+            ['pass-and-play', 'Pass & play'],
+          ] as [GameMode, string][]).map(([mode, label]) => {
+            const selected = match.mode === mode;
+            return (
+              <Pressable
+                key={mode}
+                accessibilityRole="button"
+                accessibilityState={{ selected }}
+                onPress={() => changeMode(mode)}
+                style={[
+                  styles.modeOption,
+                  {
+                    backgroundColor: selected ? colors.accent : colors.secondary,
+                    borderColor: selected ? colors.primary : colors.border,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.modeOptionText,
+                    { color: selected ? colors.primary : colors.foreground },
+                  ]}
+                >
+                  {label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <Text style={[styles.ruleText, { color: colors.secondaryForeground }]}>
+          {match.mode === 'solo'
+            ? 'Play your hand against three CPU players.'
+            : 'Every turn is a person. Cards stay covered between turns; the next player taps Show hand when the device is with them.'}
+        </Text>
+
+        {match.mode === 'pass-and-play' && (
+          <>
+            <Text style={[styles.ruleHeading, { color: colors.primary }]}>PLAYER NAMES</Text>
+            {match.playerNames.map((name, index) => (
+              <View key={index} style={styles.nameInputRow}>
+                <Text style={[styles.nameInputLabel, { color: colors.mutedForeground }]}>
+                  PLAYER {index + 1}
+                </Text>
+                <TextInput
+                  accessibilityLabel={`Player ${index + 1} name`}
+                  value={name}
+                  onChangeText={(value) => changePlayerName(index, value)}
+                  maxLength={16}
+                  autoCapitalize="words"
+                  autoCorrect={false}
+                  placeholder={`Player ${index + 1}`}
+                  placeholderTextColor={colors.mutedForeground}
+                  returnKeyType={index === 3 ? 'done' : 'next'}
+                  style={[
+                    styles.nameInput,
+                    {
+                      color: colors.foreground,
+                      backgroundColor: colors.secondary,
+                      borderColor: colors.border,
+                    },
+                  ]}
+                />
+              </View>
+            ))}
+          </>
+        )}
+
+        <Pressable
+          accessibilityRole="switch"
+          accessibilityLabel="Sound effects"
+          accessibilityState={{ checked: match.soundEnabled }}
+          onPress={toggleSound}
+          style={[styles.soundSetting, { borderTopColor: colors.border }]}
+        >
+          <View style={styles.soundSettingCopy}>
+            <Feather
+              name={match.soundEnabled ? 'volume-2' : 'volume-x'}
+              size={17}
+              color={colors.primary}
+            />
+            <Text style={[styles.soundSettingText, { color: colors.foreground }]}>
+              Card sounds
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleTrack,
+              { backgroundColor: match.soundEnabled ? colors.primary : colors.border },
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleThumb,
+                { alignSelf: match.soundEnabled ? 'flex-end' : 'flex-start' },
+              ]}
+            />
+          </View>
+        </Pressable>
+
+        <View style={styles.modalActions}>
+          <ActionButton
+            label="New hand"
+            icon="rotate-ccw"
+            onPress={() => setModal('new-hand')}
+          />
+          <ActionButton label="Rules" icon="help-circle" onPress={() => setModal('rules')} />
+        </View>
+      </InfoModal>
+
+      <InfoModal visible={modal === 'history'} title="Hand history" onClose={() => setModal(null)}>
+        {winner === null && game.plays.length > 0 && (
+          <View style={styles.historySection}>
+            <Text style={[styles.ruleHeading, { color: colors.primary }]}>CURRENT HAND</Text>
+            {game.plays.map((play, index) => (
+              <View key={`current-${index}`} style={[styles.historyPlay, { borderBottomColor: colors.border }]}>
+                <Text style={[styles.historyPlayer, { color: colors.foreground }]}>
+                  {displayName(match, play.player)}
+                </Text>
+                <Text style={[styles.historyCards, { color: colors.secondaryForeground }]}>
+                  {describeCombo(play.combo)} · {compactCards(play.cards)}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+        {match.handHistory.length === 0 ? (
+          <Text style={[styles.ruleText, { color: colors.mutedForeground }]}>
+            {winner === null && game.plays.length > 0
+              ? 'Completed hands will appear here.'
+              : 'Completed hands will appear here after the first hand ends.'}
+          </Text>
+        ) : (
+          [...match.handHistory].reverse().map((record) => (
+            <View key={`hand-${record.handNumber}`} style={styles.historySection}>
+              <View style={styles.historyHandHeading}>
+                <View>
+                  <Text style={[styles.historyHandTitle, { color: colors.foreground }]}>
+                    HAND {record.handNumber}
+                  </Text>
+                  <Text style={[styles.historyWinner, { color: colors.primary }]}>
+                    {displayRecordName(record, record.winner)} won · {record.plays.length} plays
+                  </Text>
+                </View>
+              </View>
+              {record.plays.map((play, index) => (
+                <View
+                  key={`hand-${record.handNumber}-play-${index}`}
+                  style={[styles.historyPlay, { borderBottomColor: colors.border }]}
+                >
+                  <Text style={[styles.historyPlayer, { color: colors.foreground }]}>
+                    {displayRecordName(record, play.player)}
+                  </Text>
+                  <Text style={[styles.historyCards, { color: colors.secondaryForeground }]}>
+                    {describeCombo(play.combo)} · {compactCards(play.cards)}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          ))
+        )}
       </InfoModal>
 
       <InfoModal visible={modal === 'new-hand'} title="Start a new hand?" onClose={() => setModal(null)}>
@@ -670,96 +1136,96 @@ const styles = StyleSheet.create({
   topActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 7,
+    gap: 4,
+  },
+  topActionsCompact: {
+    gap: 2,
   },
   scorePill: {
-    height: 36,
+    height: 33,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
+    gap: 5,
+    paddingHorizontal: 8,
     borderWidth: 1,
     borderRadius: 20,
+  },
+  scorePillCompact: {
+    paddingHorizontal: 6,
   },
   scoreText: {
     fontFamily: 'Inter_700Bold',
     fontSize: 12,
   },
   iconButton: {
-    width: 36,
-    height: 36,
+    width: 33,
+    height: 33,
     borderWidth: 1,
-    borderRadius: 18,
+    borderRadius: 17,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  seatRow: {
-    flexDirection: 'row',
-    gap: 6,
+  iconButtonCompact: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
   },
-  seat: {
-    flex: 1,
-    minWidth: 0,
-    minHeight: 63,
+  circleTable: {
+    position: 'relative',
+    alignSelf: 'center',
+    marginTop: 4,
+    marginBottom: 10,
     borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 7,
-    paddingVertical: 7,
+    borderColor: '#315A45',
+    backgroundColor: '#12392B',
+    padding: 8,
+    overflow: 'visible',
   },
-  seatHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-  },
-  seatDot: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
-  },
-  seatName: {
-    fontFamily: 'Inter_700Bold',
-    fontSize: 9,
-    letterSpacing: 0.8,
-  },
-  seatCount: {
-    marginTop: 5,
-    fontFamily: 'Inter_700Bold',
-    fontSize: 15,
-  },
-  seatCardsLabel: {
-    fontFamily: 'Inter_400Regular',
-    fontSize: 9,
-  },
-  botLabel: {
+  circleTableSurface: {
     position: 'absolute',
-    top: 7,
-    right: 7,
-    fontFamily: 'Inter_600SemiBold',
-    fontSize: 7,
-    letterSpacing: 0.6,
-  },
-  table: {
-    flex: 1,
-    minHeight: 170,
-    maxHeight: 360,
-    marginTop: 12,
-    marginBottom: 15,
-    borderRadius: 24,
+    top: 8,
+    right: 8,
+    bottom: 8,
+    left: 8,
     borderWidth: 1,
-    padding: 9,
+    backgroundColor: '#143F30',
   },
-  tableInner: {
-    flex: 1,
-    borderWidth: 1,
-    borderRadius: 17,
-    paddingHorizontal: 14,
-    paddingTop: 13,
-    paddingBottom: 12,
-  },
-  tableTop: {
-    flexDirection: 'row',
+  compassSeat: {
+    position: 'absolute',
+    zIndex: 3,
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justifyContent: 'center',
+  },
+  northSeat: {
+    top: 10,
+    left: 0,
+    right: 0,
+  },
+  westSeat: {
+    top: 0,
+    bottom: 0,
+    left: 4,
+  },
+  eastSeat: {
+    top: 0,
+    right: 4,
+    bottom: 0,
+  },
+  southSeat: {
+    right: 0,
+    bottom: 10,
+    left: 0,
+  },
+  tableCenter: {
+    position: 'absolute',
+    zIndex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 4,
+  },
+  cpuSpinner: {
+    position: 'absolute',
+    bottom: -5,
   },
   tableOverline: {
     flexDirection: 'row',
@@ -787,7 +1253,7 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    minHeight: 86,
+    minHeight: 0,
   },
   playedCards: {
     flexDirection: 'row',
@@ -875,6 +1341,55 @@ const styles = StyleSheet.create({
     marginTop: 2,
     marginBottom: 8,
   },
+  hiddenHand: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+  },
+  cardBackStack: {
+    width: 148,
+    height: 77,
+    position: 'relative',
+  },
+  cardBack: {
+    position: 'absolute',
+    top: 3,
+    width: 48,
+    height: 70,
+    borderWidth: 1,
+    borderColor: '#83A48A',
+    borderRadius: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#214838',
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 2px 3px rgba(0, 0, 0, 0.22)' }
+      : {
+          shadowColor: '#000000',
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: 0.22,
+          shadowRadius: 3,
+          elevation: 2,
+        }),
+  },
+  cardBackMark: {
+    color: '#D7B46A',
+    fontSize: 19,
+  },
+  hiddenHandText: {
+    maxWidth: '100%',
+    textAlign: 'center',
+    fontFamily: 'Inter_400Regular',
+    fontSize: 10,
+  },
+  handFinished: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+  },
   handCardPosition: {
     position: 'absolute',
     top: 8,
@@ -885,11 +1400,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 7,
     overflow: 'hidden',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.14,
-    shadowRadius: 3,
-    elevation: 3,
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 2px 4px rgba(0, 0, 0, 0.14)' }
+      : {
+          shadowColor: '#000000',
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: 0.14,
+          shadowRadius: 3,
+          elevation: 3,
+        }),
   },
   cardCorner: {
     position: 'absolute',
@@ -999,5 +1518,108 @@ const styles = StyleSheet.create({
     gap: 9,
     marginTop: 3,
     marginBottom: 4,
+  },
+  modeOptions: {
+    flexDirection: 'row',
+    gap: 9,
+    marginBottom: 10,
+  },
+  modeOption: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 8,
+  },
+  modeOptionText: {
+    fontFamily: 'Inter_700Bold',
+    fontSize: 12,
+  },
+  nameInputRow: {
+    minHeight: 45,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 7,
+  },
+  nameInputLabel: {
+    width: 63,
+    fontFamily: 'Inter_700Bold',
+    fontSize: 9,
+    letterSpacing: 0.8,
+  },
+  nameInput: {
+    flex: 1,
+    height: 42,
+    borderWidth: 1,
+    borderRadius: 11,
+    paddingHorizontal: 11,
+    fontFamily: 'Inter_500Medium',
+    fontSize: 14,
+  },
+  soundSetting: {
+    minHeight: 52,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderTopWidth: 1,
+    marginTop: 16,
+    paddingTop: 11,
+    marginBottom: 13,
+  },
+  soundSettingCopy: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  soundSettingText: {
+    fontFamily: 'Inter_600SemiBold',
+    fontSize: 13,
+  },
+  toggleTrack: {
+    width: 42,
+    height: 24,
+    borderRadius: 12,
+    padding: 3,
+    justifyContent: 'center',
+  },
+  toggleThumb: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#FFFFFF',
+  },
+  historySection: {
+    marginBottom: 16,
+  },
+  historyHandHeading: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 5,
+  },
+  historyHandTitle: {
+    fontFamily: 'Inter_700Bold',
+    fontSize: 13,
+    letterSpacing: 0.8,
+  },
+  historyWinner: {
+    marginTop: 3,
+    fontFamily: 'Inter_500Medium',
+    fontSize: 11,
+  },
+  historyPlay: {
+    paddingVertical: 7,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  historyPlayer: {
+    fontFamily: 'Inter_600SemiBold',
+    fontSize: 11,
+  },
+  historyCards: {
+    marginTop: 2,
+    fontFamily: 'Inter_400Regular',
+    fontSize: 11,
   },
 });
